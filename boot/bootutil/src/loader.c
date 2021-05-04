@@ -102,6 +102,100 @@ boot_read_image_headers(struct boot_loader_state *state, bool require_all,
     return 0;
 }
 
+/**
+ * Saves boot status and shared data for current image.
+ *
+ * @param  state        Boot loader status information.
+ * @param  active_slot  Index of the slot will be loaded for current image.
+ *
+ * @return              0 on success; nonzero on failure.
+ */
+static int
+boot_add_shared_data(struct boot_loader_state *state,
+                     uint32_t active_slot)
+{
+#if defined(MCUBOOT_MEASURED_BOOT) || defined(MCUBOOT_DATA_SHARING)
+    int rc;
+
+#ifdef MCUBOOT_MEASURED_BOOT
+    rc = boot_save_boot_status(BOOT_CURR_IMG(state),
+                                boot_img_hdr(state, active_slot),
+                                BOOT_IMG_AREA(state, active_slot));
+    if (rc != 0) {
+        BOOT_LOG_ERR("Failed to add image data to shared area");
+        return rc;
+    }
+#endif /* MCUBOOT_MEASURED_BOOT */
+
+#ifdef MCUBOOT_DATA_SHARING
+    rc = boot_save_shared_data(boot_img_hdr(state, active_slot),
+                                BOOT_IMG_AREA(state, active_slot));
+    if (rc != 0) {
+        BOOT_LOG_ERR("Failed to add data to shared memory area.");
+        return rc;
+    }
+#endif /* MCUBOOT_DATA_SHARING */
+
+    return 0;
+
+#else /* MCUBOOT_MEASURED_BOOT || MCUBOOT_DATA_SHARING */
+    (void) (state);
+    (void) (active_slot);
+
+    return 0;
+#endif
+}
+
+/**
+ * Fills rsp to indicate how booting should occur.
+ *
+ * @param  state        Boot loader status information.
+ * @param  slot_usage   Information about the active and available slots.
+ *                      Only used in MCUBOOT_DIRECT_XIP and MCUBOOT_RAM_LOAD
+ * @param  rsp          boot_rsp struct to fill.
+ */
+static void
+fill_rsp(struct boot_loader_state *state, void *slot_usage,
+         struct boot_rsp *rsp)
+{
+    uint32_t active_slot;
+
+#if (BOOT_IMAGE_NUMBER > 1)
+    /* Always boot from Image 0. */
+    BOOT_CURR_IMG(state) = 0;
+#endif
+
+#ifdef defined(MCUBOOT_DIRECT_XIP) || defined(MCUBOOT_RAM_LOAD)
+    active_slot = ((struct slot_usage *)slot_usage)[BOOT_CURR_IMG(state)].active_slot;
+#else
+    active_slot = BOOT_PRIMARY_SLOT;
+#endif
+
+    rsp->br_flash_dev_id = BOOT_IMG_AREA(state, active_slot)->fa_device_id;
+    rsp->br_image_off = boot_img_slot_off(state, active_slot);
+    rsp->br_hdr = boot_img_hdr(state, active_slot);
+}
+
+/**
+ * Closes all flash areas.
+ *
+ * @param  state    Boot loader status information.
+ */
+static void
+close_all_flash_areas(struct boot_loader_state *state)
+{
+    uint32_t slot;
+
+    IMAGES_ITER(BOOT_CURR_IMG(state)) {
+#if MCUBOOT_SWAP_USING_SCRATCH
+        flash_area_close(BOOT_SCRATCH_AREA(state));
+#endif
+        for (slot = 0; slot < BOOT_NUM_SLOTS; slot++) {
+            flash_area_close(BOOT_IMG_AREA(state, BOOT_NUM_SLOTS - 1 - slot));
+        }
+    }
+}
+
 #if !defined(MCUBOOT_DIRECT_XIP)
 /*
  * Compute the total size of the given image.  Includes the size of
@@ -1704,6 +1798,50 @@ boot_prepare_image_for_update(struct boot_loader_state *state,
     }
 }
 
+/**
+ * Updates the security counter for the current image.
+ *
+ * @param  state        Boot loader status information.
+ *
+ * @return              0 on success; nonzero on failure.
+ */
+static int
+boot_update_hw_rollback_protection(struct boot_loader_state *state)
+{
+#ifdef MCUBOOT_HW_ROLLBACK_PROT
+    int rc;
+
+    /* Update the stored security counter with the active image's security
+    * counter value. It will only be updated if the new security counter is
+    * greater than the stored value.
+    *
+    * In case of a successful image swapping when the swap type is TEST the
+    * security counter can be increased only after a reset, when the swap
+    * type is NONE and the image has marked itself "OK" (the image_ok flag
+    * has been set). This way a "revert" can be performed when it's
+    * necessary.
+    */
+    if (BOOT_SWAP_TYPE(state) == BOOT_SWAP_TYPE_NONE) {
+        rc = boot_update_security_counter(
+                                BOOT_CURR_IMG(state),
+                                BOOT_PRIMARY_SLOT,
+                                boot_img_hdr(state, BOOT_PRIMARY_SLOT));
+        if (rc != 0) {
+            BOOT_LOG_ERR("Security counter update failed after image "
+                            "validation.");
+            return rc;
+        }
+    }
+
+    return 0;
+
+#else /* MCUBOOT_HW_ROLLBACK_PROT */
+    (void) (state);
+
+    return 0;
+#endif
+}
+
 fih_int
 context_boot_go(struct boot_loader_state *state, struct boot_rsp *rsp)
 {
@@ -1896,55 +2034,16 @@ context_boot_go(struct boot_loader_state *state, struct boot_rsp *rsp)
         }
 #endif /* MCUBOOT_VALIDATE_PRIMARY_SLOT */
 
-#ifdef MCUBOOT_HW_ROLLBACK_PROT
-        /* Update the stored security counter with the active image's security
-         * counter value. It will only be updated if the new security counter is
-         * greater than the stored value.
-         *
-         * In case of a successful image swapping when the swap type is TEST the
-         * security counter can be increased only after a reset, when the swap
-         * type is NONE and the image has marked itself "OK" (the image_ok flag
-         * has been set). This way a "revert" can be performed when it's
-         * necessary.
-         */
-        if (BOOT_SWAP_TYPE(state) == BOOT_SWAP_TYPE_NONE) {
-            rc = boot_update_security_counter(
-                                    BOOT_CURR_IMG(state),
-                                    BOOT_PRIMARY_SLOT,
-                                    boot_img_hdr(state, BOOT_PRIMARY_SLOT));
-            if (rc != 0) {
-                BOOT_LOG_ERR("Security counter update failed after image "
-                             "validation.");
-                goto out;
-            }
-        }
-#endif /* MCUBOOT_HW_ROLLBACK_PROT */
-
-#ifdef MCUBOOT_MEASURED_BOOT
-        rc = boot_save_boot_status(BOOT_CURR_IMG(state),
-                                   boot_img_hdr(state, BOOT_PRIMARY_SLOT),
-                                   BOOT_IMG_AREA(state, BOOT_PRIMARY_SLOT));
+        rc = boot_update_hw_rollback_protection(state);
         if (rc != 0) {
-            BOOT_LOG_ERR("Failed to add Image %u data to shared memory area",
-                         BOOT_CURR_IMG(state));
             goto out;
         }
-#endif /* MCUBOOT_MEASURED_BOOT */
 
-#ifdef MCUBOOT_DATA_SHARING
-        rc = boot_save_shared_data(boot_img_hdr(state, BOOT_PRIMARY_SLOT),
-                                   BOOT_IMG_AREA(state, BOOT_PRIMARY_SLOT));
+        rc = boot_add_shared_data(state, BOOT_PRIMARY_SLOT);
         if (rc != 0) {
-            BOOT_LOG_ERR("Failed to add data to shared memory area.");
             goto out;
         }
-#endif /* MCUBOOT_DATA_SHARING */
     }
-
-#if (BOOT_IMAGE_NUMBER > 1)
-    /* Always boot from the primary slot of Image 0. */
-    BOOT_CURR_IMG(state) = 0;
-#endif
 
     /*
      * Since the boot_status struct stores plaintext encryption keys, reset
@@ -1953,20 +2052,11 @@ context_boot_go(struct boot_loader_state *state, struct boot_rsp *rsp)
      */
     memset(&bs, 0, sizeof(struct boot_status));
 
-    rsp->br_flash_dev_id = BOOT_IMG_AREA(state, BOOT_PRIMARY_SLOT)->fa_device_id;
-    rsp->br_image_off = boot_img_slot_off(state, BOOT_PRIMARY_SLOT);
-    rsp->br_hdr = boot_img_hdr(state, BOOT_PRIMARY_SLOT);
+    fill_rsp(state, NULL, rsp);
 
     fih_rc = FIH_SUCCESS;
 out:
-    IMAGES_ITER(BOOT_CURR_IMG(state)) {
-#if MCUBOOT_SWAP_USING_SCRATCH
-        flash_area_close(BOOT_SCRATCH_AREA(state));
-#endif
-        for (slot = 0; slot < BOOT_NUM_SLOTS; slot++) {
-            flash_area_close(BOOT_IMG_AREA(state, BOOT_NUM_SLOTS - 1 - slot));
-        }
-    }
+    close_all_flash_areas(state);
 
     if (rc) {
         fih_rc = fih_int_encode(rc);
@@ -2183,48 +2273,6 @@ print_loaded_images(struct boot_loader_state *state,
     }
 }
 #endif
-
-/**
- * Fills rsp to indicate how booting should occur.
- *
- * @param  state        Boot loader status information.
- * @param  slot_usage   Information about the active and available slots.
- * @param  rsp          boot_rsp struct to fill.
- */
-static void
-fill_rsp(struct boot_loader_state *state, struct slot_usage_t slot_usage[],
-         struct boot_rsp *rsp)
-{
-    uint32_t active_slot;
-
-#if (BOOT_IMAGE_NUMBER > 1)
-    /* Always boot from Image 0. */
-    BOOT_CURR_IMG(state) = 0;
-#endif
-
-    active_slot = slot_usage[BOOT_CURR_IMG(state)].active_slot;
-
-    rsp->br_flash_dev_id = BOOT_IMG_AREA(state, active_slot)->fa_device_id;
-    rsp->br_image_off = boot_img_slot_off(state, active_slot);
-    rsp->br_hdr = boot_img_hdr(state, active_slot);
-}
-
-/**
- * Closes all flash areas.
- *
- * @param  state    Boot loader status information.
- */
-static void
-close_all_flash_areas(struct boot_loader_state *state)
-{
-    uint32_t slot;
-
-    IMAGES_ITER(BOOT_CURR_IMG(state)) {
-        for (slot = 0; slot < BOOT_NUM_SLOTS; slot++) {
-            flash_area_close(BOOT_IMG_AREA(state, BOOT_NUM_SLOTS - 1 - slot));
-        }
-    }
-}
 
 #ifdef MCUBOOT_DIRECT_XIP_REVERT
 /**
@@ -2858,14 +2906,14 @@ boot_update_hw_rollback_protection(struct boot_loader_state *state,
     int rc;
 
     /* Update the stored security counter with the newer (active) image's
-        * security counter value.
-        */
+    * security counter value.
+    */
 #ifdef MCUBOOT_DIRECT_XIP_REVERT
     /* When the 'revert' mechanism is enabled in direct-xip mode, the
-        * security counter can be increased only after reboot, if the image
-        * has been confirmed at runtime (the image_ok flag has been set).
-        * This way a 'revert' can be performed when it's necessary.
-        */
+    * security counter can be increased only after reboot, if the image
+    * has been confirmed at runtime (the image_ok flag has been set).
+    * This way a 'revert' can be performed when it's necessary.
+    */
     if (slot_usage[BOOT_CURR_IMG(state)].swap_state.image_ok == BOOT_FLAG_SET) {
 #endif
         rc = boot_update_security_counter(BOOT_CURR_IMG(state), active_slot,
@@ -2882,50 +2930,6 @@ boot_update_hw_rollback_protection(struct boot_loader_state *state,
     return 0;
 
 #else /* MCUBOOT_HW_ROLLBACK_PROT */
-    (void) (state);
-    (void) (active_slot);
-
-    return 0;
-#endif
-}
-
-/**
- * Saves boot status and shared data for current image.
- *
- * @param  state        Boot loader status information.
- * @param  active_slot  Index of the slot will be loaded for current image.
- *
- * @return              0 on success; nonzero on failure.
- */
-static int
-boot_add_shared_data(struct boot_loader_state *state,
-                     uint32_t active_slot)
-{
-#if defined(MCUBOOT_MEASURED_BOOT) || defined(MCUBOOT_DATA_SHARING)
-    int rc;
-
-#ifdef MCUBOOT_MEASURED_BOOT
-    rc = boot_save_boot_status(BOOT_CURR_IMG(state),
-                                boot_img_hdr(state, active_slot),
-                                BOOT_IMG_AREA(state, active_slot));
-    if (rc != 0) {
-        BOOT_LOG_ERR("Failed to add image data to shared area");
-        return rc;
-    }
-#endif /* MCUBOOT_MEASURED_BOOT */
-
-#ifdef MCUBOOT_DATA_SHARING
-    rc = boot_save_shared_data(boot_img_hdr(state, active_slot),
-                                BOOT_IMG_AREA(state, active_slot));
-    if (rc != 0) {
-        BOOT_LOG_ERR("Failed to add data to shared memory area.");
-        return rc;
-    }
-#endif /* MCUBOOT_DATA_SHARING */
-
-    return 0;
-
-#else /* MCUBOOT_MEASURED_BOOT || MCUBOOT_DATA_SHARING */
     (void) (state);
     (void) (active_slot);
 
